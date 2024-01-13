@@ -30,6 +30,7 @@
             android:textColor="@android:color/white"
             android:layout_marginRight="5dp" />
         <Button
+            android:visibility="gone"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"

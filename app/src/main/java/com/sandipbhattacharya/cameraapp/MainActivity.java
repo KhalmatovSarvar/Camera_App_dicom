@@ -8,6 +8,7 @@ import android.Manifest;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
@@ -35,6 +36,8 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.Toast;
 
+import com.sandipbhattacharya.cameraapp.helper.MultiFrameJpg2Dcm;
+
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -52,6 +55,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "AndroidCameraApi";
     private Button btnTake;
     private Button btnGallery;
+    private int FPS = 0;
+
     private TextureView textureView;
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
 
@@ -61,7 +66,9 @@ public class MainActivity extends AppCompatActivity {
         ORIENTATIONS.append(Surface.ROTATION_180, 270);
         ORIENTATIONS.append(Surface.ROTATION_270, 180);
     }
-
+    private static final long FRAME_INTERVAL_MS = 80;
+    private Handler captureHandler = new Handler();
+    private int capturedFrames = 0;
     private String cameraId;
     protected CameraDevice cameraDevice;
     protected CameraCaptureSession cameraCaptureSessions;
@@ -70,29 +77,38 @@ public class MainActivity extends AppCompatActivity {
     private ImageReader imageReader;
     private File file;
     private File folder;
+    private int frameCount = 0;
+    private Boolean isClicked = false;
+    private Boolean isThirdFrame = false;
     private String folderName = "MyPhotoDir";
     private static final int REQUEST_CAMERA_PERMISSION = 200;
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
+    private List<Bitmap> frameList = new ArrayList<>(6);
 
+    private long lastCaptureTime = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        Log.d("LISTSIZE", "onCreate: "+frameList.size());
         textureView = findViewById(R.id.texture);
-        if(textureView != null)
+        if (textureView != null)
             textureView.setSurfaceTextureListener(textureListener);
         btnTake = findViewById(R.id.btnTake);
         btnGallery = findViewById(R.id.btnGallery);
-        if(btnTake != null)
+        if (btnTake != null)
             btnTake.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View view) {
-                    takePicture();
+                    isClicked = true;
+                    Log.d("CCC", "onClick: CLICKED");
+
+//                    takePicture();
                 }
             });
-        if(btnGallery != null)
+        if (btnGallery != null)
             btnGallery.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View view) {
@@ -121,8 +137,80 @@ public class MainActivity extends AppCompatActivity {
 
         @Override
         public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+            if (isClicked && capturedFrames < 6) {
+                long currentTime = System.currentTimeMillis();
+
+                // Ensure a minimum interval between Runnable executions
+                if (currentTime - lastCaptureTime >= FRAME_INTERVAL_MS) {
+                    capturedFrames++;
+                    lastCaptureTime = currentTime;
+
+                    Log.d("FRAMELISTLAST", "LAST: "+lastCaptureTime);
+                    // Capture frame
+                    Bitmap frame =  captureFrame();
+                    if (frame != null) {
+                        frameList.add(frame);
+                        Log.d("FRAMELIST", "LIST : " + frameList.size());
+
+                        if (capturedFrames == 6) {
+                            frameList.remove(0);
+                            // Save frames asynchronously in a background thread
+                            SaveFramesUtils.saveFramesAsync(frameList, new SaveFramesUtils.SaveFramesCallback() {
+                                @Override
+                                public void onSaveComplete() {
+                                    frameList.clear();
+                                    Log.d("FRAMELIST", "reached: " + frameList.size());
+                                    createDcmFile();
+                                    isClicked = false;
+                                    capturedFrames = 0;
+                                }
+                            });
+                            Log.d("FRAMELIST", "reached: "+frameList.size());
+                        }
+                    }
+                }
+            }
         }
     };
+
+    private void createDcmFile() {
+        try {
+            // Get external storage directory
+            File externalStorageDirectory = Environment.getExternalStorageDirectory();
+
+            // Specify the folder containing JPEG images
+            File jpegFolder = new File(externalStorageDirectory, "Download/DICOM");
+
+            // Specify the output DICOM file
+            File dicomOutputFile = new File(externalStorageDirectory, "Download/multiframe.dcm");
+
+            File[] jpegFiles = jpegFolder.listFiles((dir, name) -> name.toLowerCase().endsWith(".jpeg"));
+            if (jpegFiles != null && jpegFiles.length > 0) {
+                for (File file : jpegFiles) {
+                    Log.d("@@@", "Found JPEG file: " + file.getName());
+                }
+                MultiFrameJpg2Dcm multiFrameJpg2Dcm = new MultiFrameJpg2Dcm(jpegFiles, dicomOutputFile);
+                Log.d("@@@", "Multi-Frame DICOM file created successfully: " + dicomOutputFile.getAbsolutePath());
+            } else {
+                Log.d("@@@", "No JPEG files found in the specified folder.");
+            }
+
+        } catch (Exception e) {
+            Log.d("@@@", "Error creating Multi-Frame DICOM: " + e);
+            e.printStackTrace();
+        }
+    }
+
+    private Bitmap captureFrame() {
+        Bitmap frame = null;
+        try {
+            frame = Bitmap.createBitmap(textureView.getWidth(), textureView.getHeight(), Bitmap.Config.ARGB_8888);
+            textureView.getBitmap(frame);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return frame;
+    }
 
     private final CameraDevice.StateCallback stateCallback = new CameraDevice.StateCallback() {
         @Override
@@ -162,108 +250,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    protected void takePicture() {
-        if (cameraDevice == null) {
-            Log.e(TAG, "cameraDevice is null");
-            return;
-        }
-        if (!isExternalStorageAvailableForRW() || isExternalStorageReadOnly()) {
-            btnTake.setEnabled(false);
-        }
-        if (isStoragePermissionGranted()) {
-            CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-            try {
-                CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraDevice.getId());
-                Size[] jpegSizes = null;
-                if (characteristics != null) {
-                    jpegSizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP).getOutputSizes(ImageFormat.JPEG);
-                }
-                int width = 640;
-                int height = 480;
-                if (jpegSizes != null && jpegSizes.length > 0) {
-                    width = jpegSizes[0].getWidth();
-                    height = jpegSizes[0].getHeight();
-                }
-                ImageReader reader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 1);
-                List<Surface> outputSurfaces = new ArrayList<Surface>(2);
-                outputSurfaces.add(reader.getSurface());
-                outputSurfaces.add(new Surface(textureView.getSurfaceTexture()));
-                final CaptureRequest.Builder captureBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-                captureBuilder.addTarget(reader.getSurface());
-                captureBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
-                // Orientation
-                int rotation = getWindowManager().getDefaultDisplay().getRotation();
-                captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, ORIENTATIONS.get(rotation));
-                file = null;
-                folder = new File(folderName);
-                String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
-                String imageFileName = "IMG_" + timeStamp + ".jpg";
-                file = new File(getExternalFilesDir(folderName), "/" + imageFileName);
-                if (!folder.exists()) {
-                    folder.mkdirs();
-                }
-                ImageReader.OnImageAvailableListener readerListener = new ImageReader.OnImageAvailableListener() {
-                    @Override
-                    public void onImageAvailable(ImageReader reader) {
-                        Image image = null;
-                        try {
-                            image = reader.acquireLatestImage();
-                            ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                            byte[] bytes = new byte[buffer.capacity()];
-                            buffer.get(bytes);
-                            save(bytes);
-                        } catch (FileNotFoundException e) {
-                            e.printStackTrace();
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        } finally {
-                            if (image != null) {
-                                image.close();
-                            }
-                        }
-                    }
-
-                    private void save(byte[] bytes) throws IOException {
-                        OutputStream output = null;
-                        try {
-                            output = new FileOutputStream(file);
-                            output.write(bytes);
-                        } finally {
-                            if (null != output) {
-                                output.close();
-                            }
-                        }
-                    }
-                };
-                reader.setOnImageAvailableListener(readerListener, mBackgroundHandler);
-                final CameraCaptureSession.CaptureCallback captureListener = new CameraCaptureSession.CaptureCallback() {
-                    @Override
-                    public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
-                        super.onCaptureCompleted(session, request, result);
-                        Toast.makeText(MainActivity.this, "Saved:" + file, Toast.LENGTH_SHORT).show();
-                        Log.d(TAG, "" + file);
-                        createCameraPreview();
-                    }
-                };
-                cameraDevice.createCaptureSession(outputSurfaces, new CameraCaptureSession.StateCallback() {
-                    @Override
-                    public void onConfigured(CameraCaptureSession session) {
-                        try {
-                            session.capture(captureBuilder.build(), captureListener, mBackgroundHandler);
-                        } catch (CameraAccessException e) {
-                            e.printStackTrace();
-                        }
-                    }
-
-                    @Override
-                    public void onConfigureFailed(CameraCaptureSession session) {
-                    }
-                }, mBackgroundHandler);
-            } catch (CameraAccessException e) {
-                e.printStackTrace();
-            }
-        }
-    }
 
     private static boolean isExternalStorageReadOnly() {
         String extStorageState = Environment.getExternalStorageState();
@@ -351,7 +337,6 @@ public class MainActivity extends AppCompatActivity {
         }
         Log.e(TAG, "openCamera X");
     }
-
     protected void updatePreview() {
         if (null == cameraDevice) {
             Log.e(TAG, "updatePreview error, return");
